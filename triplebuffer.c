@@ -146,26 +146,42 @@ static void swap_buffers(void)
  *   1. GDMA: Copy Work → Back
  *   2. Pointer swap: Back ↔ Front
  */
-static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
+static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, 
+                           lv_color_t *color_map)
 {
-    if (lv_disp_flush_is_last(drv)) {
-        /*
-         * Frame is complete in the Work Buffer.
-         * Now copy to Back Buffer via GDMA.
-         */
-        gdma_copy_buffer(back_buf, work_buf, FB_SIZE);
-        
-        /*
-         * Swap: Back becomes Front (displayed), Front becomes Back
-         */
-        swap_buffers();
-
-        ESP_LOGD(TAG, "Frame done → GDMA copy + swap");
+    // LVGL hat einen Streifen im schnellen internen RAM gerendert.
+    // Jetzt kopieren wir nur diesen Streifen in den PSRAM Work Buffer.
+    
+    uint32_t w = area->x2 - area->x1 + 1;
+    uint32_t h = area->y2 - area->y1 + 1;
+    
+    // Zeilenweise in den Work Buffer (PSRAM) kopieren
+    for (int y = 0; y < h; y++) {
+        uint16_t *src = (uint16_t *)color_map + y * w;
+        uint16_t *dst = (uint16_t *)work_buf + 
+                        ((area->y1 + y) * DISP_WIDTH + area->x1);
+        memcpy(dst, src, w * sizeof(uint16_t));
     }
 
-    // Tell LVGL that flush is done → can continue rendering
+    if (lv_disp_flush_is_last(drv)) {
+        // Frame komplett → GDMA copy work → back, dann swap
+        gdma_copy_buffer(back_buf, work_buf, FB_SIZE);
+        swap_buffers();
+    }
+
     lv_disp_flush_ready(drv);
 }
+```
+
+## Der Unterschied
+```
+Direct Mode (vorher):
+  LVGL → random writes in PSRAM (langsam!) → GDMA → swap
+
+Partial Mode (besser):
+  LVGL → random writes in internem SRAM (schnell!)
+       → sequentieller memcpy in PSRAM (cache-freundlich)
+       → GDMA → swap
 
 /* ============================================================
  * Buffer Allocation
@@ -250,22 +266,25 @@ static esp_err_t lcd_panel_init(void)
  * LVGL Setup
  * ============================================================ */
 
+// Kleiner Buffer im schnellen internen SRAM
+// 720 x 40 Zeilen = 57.600 Bytes → passt ins interne RAM
+#define BUF_LINES  40
+static lv_color_t *render_buf = NULL;
+
 static void lvgl_display_init(void)
 {
     lv_init();
 
-    /*
-     * LVGL Draw Buffer = our Work Buffer (full-frame)
-     * 
-     * Second buffer set to NULL → LVGL uses single-buffer mode
-     * This means LVGL renders everything into work_buf and calls flush_cb.
-     * 
-     * We only swap after the LAST flush of a frame.
-     */
-    lv_disp_draw_buf_init(&s_draw_buf, 
-                           (lv_color_t *)work_buf,  // buf1 = work buffer
-                           NULL,                     // buf2 = NULL (single buffer)
-                           DISP_WIDTH * DISP_HEIGHT);
+    // Render-Buffer im schnellen internen RAM!
+    render_buf = (lv_color_t *)heap_caps_malloc(
+        DISP_WIDTH * BUF_LINES * sizeof(lv_color_t), 
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA
+    );
+
+    lv_disp_draw_buf_init(&s_draw_buf,
+                           render_buf,               // Schneller interner Buffer
+                           NULL,
+                           DISP_WIDTH * BUF_LINES);  // Nicht full-frame!
 
     lv_disp_drv_init(&s_disp_drv);
     s_disp_drv.hor_res = DISP_WIDTH;
@@ -273,26 +292,11 @@ static void lvgl_display_init(void)
     s_disp_drv.flush_cb = lvgl_flush_cb;
     s_disp_drv.draw_buf = &s_draw_buf;
     
-    /*
-     * DIRECT MODE: LVGL writes directly into our Work Buffer
-     * at the correct pixel positions. No extra copying needed.
-     * LVGL only updates the dirty regions in the Work Buffer.
-     */
-    s_disp_drv.direct_mode = 1;
-
-    /*
-     * Full refresh OFF: LVGL only renders dirty areas
-     * This saves CPU time since only changed regions are computed.
-     */
+    // KEIN direct_mode → LVGL rendert in den kleinen internen Buffer
+    s_disp_drv.direct_mode = 0;
     s_disp_drv.full_refresh = 0;
 
-    lv_disp_t *disp = lv_disp_drv_register(&s_disp_drv);
-    if (!disp) {
-        ESP_LOGE(TAG, "LVGL display registration failed!");
-    }
-
-    ESP_LOGI(TAG, "LVGL display initialized: %dx%d, direct_mode, triple-buffer",
-             DISP_WIDTH, DISP_HEIGHT);
+    lv_disp_drv_register(&s_disp_drv);
 }
 
 /* ============================================================
